@@ -36,26 +36,27 @@ class TaskForm(StatesGroup):
     waiting_for_task = State()
     waiting_for_deadline_date = State()
     waiting_for_deadline_time = State()
+    waiting_for_notes = State()
 
 # Функция получения списка дел из базы данных для конкретного пользователя
 async def get_todo_list(user_id):
     user = await collection.find_one({"user_id": user_id})
-    if user and "tasks" in user and user["tasks"]:
+    if user and "tasks" in user:
         return user["tasks"]
     return []
 
 # Функция добавления задачи в базу данных (изменено)
-async def add_task_to_db(user_id, username, task_text, deadline):
+async def add_task_to_db(user_id, username, task_text, deadline, notes=""):
     try:
         await collection.update_one(
             {"user_id": user_id},
             {
                 "$setOnInsert": {"user_id": user_id, "username": username},
-                "$push": {"tasks": {"task_text": task_text, "deadline": deadline}}
+                "$push": {"tasks": {"task_text": task_text, "deadline": deadline, "notes": notes}}
             },
             upsert=True
         )
-        print(f"Задача добавлена в базу данных: user_id={user_id}, username={username}, task={task_text}, deadline={deadline}")
+        print(f"Задача добавлена в базу данных: user_id={user_id}, username={username}, task={task_text}, deadline={deadline}, notes={notes}")
     except Exception as e:
         print(f"Ошибка при добавлении задачи в базу данных: {e}")
 
@@ -98,14 +99,20 @@ async def start_handler(message: types.Message):
 # Обработчик кнопки "Показать список дел"
 @dp.message(lambda message: message.text == "Показать список дел")
 async def show_todo_list(message: types.Message):
-    tasks = await get_todo_list(message.from_user.id)
+    user_id = message.from_user.id
+    tasks = await get_todo_list(user_id)
+
     if tasks:
         task_list_text = ""
-        for task in tasks:
-            task_text = task.get('task_text')
-            deadline = task.get('deadline')
-            if task_text and deadline:
-                task_list_text += f"Задача: {task_text}, Дедлайн: {deadline}\n"
+        for task_data in tasks:
+            if isinstance(task_data, dict): # Проверяем, что task_data - это словарь
+              task_text = task_data.get('task_text')
+              deadline = task_data.get('deadline')
+              notes = task_data.get('notes', "") # Если нет notes, то будет пустая строка
+              if task_text and deadline:
+                task_list_text += f"Задача: {task_text}, Дедлайн: {deadline}, Примечания: {notes}\n"
+            else:
+                print(f"Неверный формат данных в tasks: {task_data}") #Отладочный вывод
     else:
         task_list_text = "Список задач пуст."
     todo_keyboard = await create_todo_keyboard()
@@ -150,15 +157,29 @@ async def get_deadline_time(message: types.Message, state: FSMContext):
         # Объединяем дату и время в строку
         deadline = f"{deadline_date} {deadline_time}"
 
-        user_id = message.from_user.id
-        username = message.from_user.username
-        await add_task_to_db(user_id, username, task_text, deadline)
-        await message.answer(f"Задача '{task_text}' с дедлайном '{deadline}' успешно добавлена!")
-        await state.clear()
-        await show_todo_list(message)
+        await state.update_data(deadline = deadline)
+        await message.answer("Введите примечания к задаче (или нажмите /skip, чтобы пропустить):")
+        await state.set_state(TaskForm.waiting_for_notes)
 
     except ValueError:
         await message.answer("Неверный формат времени. Пожалуйста, используйте формат ЧЧ:ММ (24-часовой формат).")
+
+@dp.message(TaskForm.waiting_for_notes)
+async def get_notes(message: types.Message, state: FSMContext):
+    notes = message.text
+    if notes == "/skip":
+        notes = ""
+
+    user_data = await state.get_data()
+    task_text = user_data.get('task_text')
+    deadline = user_data.get('deadline')
+
+    user_id = message.from_user.id
+    username = message.from_user.username
+    await add_task_to_db(user_id, username, task_text, deadline, notes)
+    await message.answer(f"Задача '{task_text}' с дедлайном '{deadline}' и примечаниями '{notes}' успешно добавлена!")
+    await state.clear()
+    await show_todo_list(message)
 
 # Обработчик кнопки "Назад в меню"
 @dp.message(lambda message: message.text == "Назад в меню")
