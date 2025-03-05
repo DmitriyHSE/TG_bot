@@ -38,7 +38,7 @@ class TaskForm(StatesGroup):
     waiting_for_deadline_date = State()
     waiting_for_deadline_time = State()
     waiting_for_notes = State()
-    waiting_for_date_to_delete = State()  # Новое состояние для ввода даты удаления
+    waiting_for_date_to_delete = State()
 
 # Функция получения списка дел из базы данных для конкретного пользователя
 async def get_todo_list(user_id):
@@ -54,13 +54,29 @@ async def add_task_to_db(user_id, username, task_text, deadline, notes=""):
             {"user_id": user_id},
             {
                 "$setOnInsert": {"user_id": user_id, "username": username},
-                "$push": {"tasks": {"task_text": task_text, "deadline": deadline, "notes": notes}}
+                "$push": {
+                    "tasks": {
+                        "task_text": task_text,
+                        "deadline": deadline,
+                        "notes": notes,
+                        "status": "в процессе"  # Статус по умолчанию
+                    }
+                }
             },
             upsert=True
         )
         print(f"Задача добавлена в базу данных: user_id={user_id}, username={username}, task={task_text}, deadline={deadline}, notes={notes}")
     except Exception as e:
         print(f"Ошибка при добавлении задачи в базу данных: {e}")
+
+# Функция обновления статуса задачи
+async def update_task_status(task):
+    deadline = datetime.strptime(task["deadline"], "%d-%m-%Y %H:%M")
+    now = datetime.now()
+    if task["status"] != "выполнено":  # Если задача не выполнена
+        if now > deadline:
+            task["status"] = "просрочено"
+    return task
 
 # Клавиатура списка дел
 async def create_todo_keyboard(tasks):
@@ -71,7 +87,7 @@ async def create_todo_keyboard(tasks):
             if task_text:
                 buttons.append([KeyboardButton(text=task_text)])
     buttons.append([KeyboardButton(text="Добавить задачу")])
-    buttons.append([KeyboardButton(text="Удалить дела по дате")])  # Новая кнопка
+    buttons.append([KeyboardButton(text="Удалить дела по дате")])
     buttons.append([KeyboardButton(text="Назад в меню")])
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True, one_time_keyboard=True)
 
@@ -112,14 +128,49 @@ async def show_todo_list(message: types.Message):
         task_list_text = "Ваши задачи:\n"
         for task_data in tasks:
             if isinstance(task_data, dict):
+                # Обновляем статус задачи
+                task_data = await update_task_status(task_data)
                 task_text = task_data.get('task_text')
-                deadline = task_data.get('deadline')
-                if task_text and deadline:
-                    task_list_text += f"Задача: {task_text}, Дедлайн: {deadline}\n"
+                deadline_str = task_data.get('deadline')
+                status = task_data.get('status', 'в процессе')
+
+                # Определяем смайлик для статуса
+                status_emoji = {
+                    "в процессе": "🟡",
+                    "выполнено": "✅",
+                    "просрочено": "❌"
+                }.get(status, "🟡")
+
+                if task_text and deadline_str:
+                    # Преобразуем строку дедлайна в объект datetime
+                    deadline = datetime.strptime(deadline_str, "%d-%m-%Y %H:%M")
+                    # Получаем текущее время
+                    now = datetime.now()
+                    # Вычисляем разницу между дедлайном и текущим временем
+                    time_left = deadline - now
+                    # Получаем количество дней, часов и минут
+                    days = time_left.days
+                    hours, remainder = divmod(time_left.seconds, 3600)
+                    minutes = remainder // 60
+                    # Формируем строку с оставшимся временем
+                    time_left_str = f"{days} дней, {hours} часов, {minutes} минут"
+                    # Добавляем задачу в список
+                    if(time_left.days<0 or minutes<0 or hours<0):
+                        task_list_text += f"{status_emoji} Задача: {task_text}, Просрочена\n"
+                    else:
+                        task_list_text += f"{status_emoji} Задача: {task_text}, Осталось: {time_left_str}\n"
         todo_keyboard = await create_todo_keyboard(tasks)
         await message.answer(task_list_text, reply_markup=todo_keyboard)
     else:
-        await message.answer("Список задач пуст.", reply_markup=main_keyboard)
+        # Если список задач пуст, показываем кнопки "Добавить задачу" и "Назад в меню"
+        empty_list_keyboard = ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="Добавить задачу")],
+                [KeyboardButton(text="Назад в меню")]
+            ],
+            resize_keyboard=True
+        )
+        await message.answer("Список задач пуст.", reply_markup=empty_list_keyboard)
 
 # Асинхронная функция для проверки, является ли сообщение задачей
 async def is_task_message(message: types.Message) -> bool:
@@ -127,7 +178,7 @@ async def is_task_message(message: types.Message) -> bool:
     tasks = await get_todo_list(user_id)
     return message.text in [task.get("task_text") for task in tasks]
 
-# Обработчик выбора задачи для показа примечаний
+# Обработчик выбора задачи
 @dp.message(is_task_message)
 async def show_task_notes(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
@@ -139,99 +190,38 @@ async def show_task_notes(message: types.Message, state: FSMContext):
             notes = task.get("notes", "Примечаний нет.")
             # Сохраняем текст задачи в состоянии
             await state.update_data(task_to_delete=task_text)
-            # Добавляем кнопку "Удалить задачу"
+            # Добавляем кнопки для управления статусом
             markup = ReplyKeyboardMarkup(
                 keyboard=[
-                    [KeyboardButton(text="Назад к списку задач")],
-                    [KeyboardButton(text="Удалить задачу")]
+                    [KeyboardButton(text="Задача выполнена")],
+                    [KeyboardButton(text="Назад к списку задач")]
                 ],
                 resize_keyboard=True
             )
-            await message.answer(f"Примечания к задаче '{task_text}':\n{notes}", reply_markup=markup)
+            await message.answer(f"Задача: {task_text}\nПримечания: {notes}", reply_markup=markup)
             break
 
-# Обработчик кнопки "Удалить задачу"
-@dp.message(lambda message: message.text == "Удалить задачу")
-async def delete_task(message: types.Message, state: FSMContext):
+# Обработчик для изменения статуса задачи
+@dp.message(lambda message: message.text == "Задача выполнена")
+async def mark_task_as_done(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
-    tasks = await get_todo_list(user_id)
-
-    # Получаем текст задачи из состояния
     user_data = await state.get_data()
-    task_to_delete = user_data.get("task_to_delete")
+    task_text = user_data.get("task_to_delete")
 
-    if task_to_delete:
-        # Удаляем задачу из базы данных
+    if task_text:
+        # Обновляем статус задачи в базе данных
         await collection.update_one(
-            {"user_id": user_id},
-            {"$pull": {"tasks": {"task_text": task_to_delete}}}
+            {"user_id": user_id, "tasks.task_text": task_text},
+            {"$set": {"tasks.$.status": "выполнено"}}
         )
-        await message.answer(f"Задача '{task_to_delete}' удалена.")
+        await message.answer(f"Задача '{task_text}' отмечена как выполненная ✅.")
 
-        # Обновляем список задач и выводим его
-        tasks = await get_todo_list(user_id)
-        if tasks:
-            task_list_text = "Ваши задачи:\n"
-            for task_data in tasks:
-                if isinstance(task_data, dict):
-                    task_text = task_data.get('task_text')
-                    deadline = task_data.get('deadline')
-                    if task_text and deadline:
-                        task_list_text += f"Задача: {task_text}, Дедлайн: {deadline}\n"
-            todo_keyboard = await create_todo_keyboard(tasks)
-            await message.answer(task_list_text, reply_markup=todo_keyboard)
-        else:
-            await message.answer("Список задач пуст.", reply_markup=main_keyboard)
+        # Возвращаем пользователя к списку задач
+        await show_todo_list(message)
     else:
         await message.answer("Задача не найдена.", reply_markup=main_keyboard)
 
-    # Очищаем состояние
-    await state.clear()
-
-# Обработчик кнопки "Удалить дела по дате"
-@dp.message(lambda message: message.text == "Удалить дела по дате")
-async def delete_tasks_by_date_start(message: types.Message, state: FSMContext):
-    await message.answer("Введите дату для удаления задач в формате ДД-ММ-ГГГГ:")
-    await state.set_state(TaskForm.waiting_for_date_to_delete)
-
-# Обработчик для удаления задач по дате
-@dp.message(TaskForm.waiting_for_date_to_delete)
-async def delete_tasks_by_date(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    date_to_delete = message.text
-
-    try:
-        # Проверка формата даты
-        datetime.strptime(date_to_delete, "%d-%m-%Y")
-
-        # Удаляем задачи с указанной датой
-        await collection.update_one(
-            {"user_id": user_id},
-            {"$pull": {"tasks": {"deadline": {"$regex": f"^{date_to_delete}"}}}}
-        )
-        await message.answer(f"Все задачи на дату {date_to_delete} удалены.")
-
-        # Обновляем список задач и выводим его
-        tasks = await get_todo_list(user_id)
-        if tasks:
-            task_list_text = "Ваши задачи:\n"
-            for task_data in tasks:
-                if isinstance(task_data, dict):
-                    task_text = task_data.get('task_text')
-                    deadline = task_data.get('deadline')
-                    if task_text and deadline:
-                        task_list_text += f"Задача: {task_text}, Дедлайн: {deadline}\n"
-            todo_keyboard = await create_todo_keyboard(tasks)
-            await message.answer(task_list_text, reply_markup=todo_keyboard)
-        else:
-            await message.answer("Список задач пуст.", reply_markup=main_keyboard)
-    except ValueError:
-        await message.answer("Неверный формат даты. Пожалуйста, используйте формат ДД-ММ-ГГГГ.")
-
-    # Очищаем состояние
-    await state.clear()
-
-# Обработчик кнопки "Назад к списку задач"
+# Обработчик для возврата к списку задач
 @dp.message(lambda message: message.text == "Назад к списку задач")
 async def back_to_tasks(message: types.Message):
     await show_todo_list(message)
@@ -250,17 +240,23 @@ async def get_task_text(message: types.Message, state: FSMContext):
     await message.answer("Введите дату дедлайна в формате ДД-ММ-ГГГГ:")
     await state.set_state(TaskForm.waiting_for_deadline_date)
 
+# Обработчик для получения даты дедлайна
 @dp.message(TaskForm.waiting_for_deadline_date)
 async def get_deadline_date(message: types.Message, state: FSMContext):
     try:
         deadline_date = message.text
-        datetime.strptime(deadline_date, "%d-%m-%Y")  # Проверка формата даты
+        deadline_datetime = datetime.strptime(deadline_date, "%d-%m-%Y")
+        now = datetime.now()
+        if deadline_datetime.date() < now.date():
+            await message.answer("❌ Нельзя выбрать дату из прошлого. Пожалуйста, введите корректную дату в формате ДД-ММ-ГГГГ:")
+            return
         await state.update_data(deadline_date=deadline_date)
         await message.answer("Введите время дедлайна в формате ЧЧ:ММ (24-часовой формат):")
         await state.set_state(TaskForm.waiting_for_deadline_time)
     except ValueError:
-        await message.answer("Неверный формат даты. Пожалуйста, используйте формат ДД-ММ-ГГГГ.")
+        await message.answer("❌ Неверный формат даты. Пожалуйста, используйте формат ДД-ММ-ГГГГ.")
 
+# Обработчик для получения времени дедлайна
 @dp.message(TaskForm.waiting_for_deadline_time)
 async def get_deadline_time(message: types.Message, state: FSMContext):
     try:
@@ -271,15 +267,23 @@ async def get_deadline_time(message: types.Message, state: FSMContext):
         deadline_date = user_data.get('deadline_date')
 
         # Объединяем дату и время в строку
-        deadline = f"{deadline_date} {deadline_time}"
+        deadline_str = f"{deadline_date} {deadline_time}"
+        deadline = datetime.strptime(deadline_str, "%d-%m-%Y %H:%M")
 
-        await state.update_data(deadline=deadline)
+        # Проверяем, что дедлайн не в прошлом
+        now = datetime.now()
+        if deadline < now:
+            await message.answer("❌ Нельзя выбрать время из прошлого. Пожалуйста, введите корректное время в формате ЧЧ:ММ:")
+            return
+
+        await state.update_data(deadline=deadline_str)
         await message.answer("Введите примечания к задаче (или нажмите /skip, чтобы пропустить):")
         await state.set_state(TaskForm.waiting_for_notes)
 
     except ValueError:
-        await message.answer("Неверный формат времени. Пожалуйста, используйте формат ЧЧ:ММ (24-часовой формат).")
+        await message.answer("❌ Неверный формат времени. Пожалуйста, используйте формат ЧЧ:ММ (24-часовой формат).")
 
+# Обработчик для получения примечаний
 @dp.message(TaskForm.waiting_for_notes)
 async def get_notes(message: types.Message, state: FSMContext):
     notes = message.text
@@ -296,18 +300,15 @@ async def get_notes(message: types.Message, state: FSMContext):
     await message.answer(f"Задача '{task_text}' с дедлайном '{deadline}' и примечаниями '{notes}' успешно добавлена!")
     await state.clear()
     await show_todo_list(message)
-
 # Обработчик кнопки "Назад в меню"
 @dp.message(lambda message: message.text == "Назад в меню")
 async def back_to_main_menu(message: types.Message):
     await message.answer("Вы вернулись в главное меню:", reply_markup=main_keyboard)
-
-# Функция запуска бота
+# Запуск бота
 async def main():
     await check_connection()
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
-# Запуск через asyncio
 if __name__ == "__main__":
     asyncio.run(main())
