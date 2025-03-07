@@ -155,10 +155,10 @@ async def show_todo_list(message: types.Message):
                     # Формируем строку с оставшимся временем
                     time_left_str = f"{days} дней, {hours} часов, {minutes} минут"
                     # Добавляем задачу в список
-                    if(time_left.days<0 or minutes<0 or hours<0):
-                        task_list_text += f"{status_emoji} Задача: {task_text}, Просрочена\n"
+                    if time_left.days < 0 or minutes < 0 or hours < 0:
+                        task_list_text += f"{status_emoji} Задача: {task_text}, Просрочена({deadline})\n"
                     else:
-                        task_list_text += f"{status_emoji} Задача: {task_text}, Осталось: {time_left_str}\n"
+                        task_list_text += f"{status_emoji} Задача: {task_text}, Осталось: {time_left_str} ({deadline})\n"
         todo_keyboard = await create_todo_keyboard(tasks)
         await message.answer(task_list_text, reply_markup=todo_keyboard)
     else:
@@ -194,6 +194,8 @@ async def show_task_notes(message: types.Message, state: FSMContext):
             markup = ReplyKeyboardMarkup(
                 keyboard=[
                     [KeyboardButton(text="Задача выполнена")],
+                    [KeyboardButton(text="Вернуть задачу в ожидание")] if task.get("status") == "выполнено" else [],
+                    [KeyboardButton(text="Удалить задачу")],
                     [KeyboardButton(text="Назад к списку задач")]
                 ],
                 resize_keyboard=True
@@ -209,12 +211,66 @@ async def mark_task_as_done(message: types.Message, state: FSMContext):
     task_text = user_data.get("task_to_delete")
 
     if task_text:
+        # Получаем задачу из базы данных
+        user = await collection.find_one({"user_id": user_id, "tasks.task_text": task_text})
+        task = next((t for t in user["tasks"] if t["task_text"] == task_text), None)
+
+        if task:
+            # Проверяем, не просрочена ли задача
+            deadline = datetime.strptime(task["deadline"], "%d-%m-%Y %H:%M")
+            now = datetime.now()
+            if now > deadline:
+                await message.answer("❌ Невозможно отметить просроченную задачу как выполненную.")
+                return
+
+            # Обновляем статус задачи в базе данных
+            await collection.update_one(
+                {"user_id": user_id, "tasks.task_text": task_text},
+                {"$set": {"tasks.$.status": "выполнено"}}
+            )
+            await message.answer(f"Задача '{task_text}' отмечена как выполненная ✅.")
+
+            # Возвращаем пользователя к списку задач
+            await show_todo_list(message)
+        else:
+            await message.answer("Задача не найдена.", reply_markup=main_keyboard)
+    else:
+        await message.answer("Задача не найдена.", reply_markup=main_keyboard)
+
+# Обработчик для изменения статуса задачи с "выполнено" на "в ожидании"
+@dp.message(lambda message: message.text == "Вернуть задачу в ожидание")
+async def mark_task_as_pending(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    user_data = await state.get_data()
+    task_text = user_data.get("task_to_delete")
+
+    if task_text:
         # Обновляем статус задачи в базе данных
         await collection.update_one(
             {"user_id": user_id, "tasks.task_text": task_text},
-            {"$set": {"tasks.$.status": "выполнено"}}
+            {"$set": {"tasks.$.status": "в процессе"}}
         )
-        await message.answer(f"Задача '{task_text}' отмечена как выполненная ✅.")
+        await message.answer(f"Задача '{task_text}' возвращена в ожидание 🟡.")
+
+        # Возвращаем пользователя к списку задач
+        await show_todo_list(message)
+    else:
+        await message.answer("Задача не найдена.", reply_markup=main_keyboard)
+
+# Обработчик для удаления задачи
+@dp.message(lambda message: message.text == "Удалить задачу")
+async def delete_task(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    user_data = await state.get_data()
+    task_text = user_data.get("task_to_delete")
+
+    if task_text:
+        # Удаляем задачу из базы данных
+        await collection.update_one(
+            {"user_id": user_id},
+            {"$pull": {"tasks": {"task_text": task_text}}}
+        )
+        await message.answer(f"Задача '{task_text}' удалена 🗑️.")
 
         # Возвращаем пользователя к списку задач
         await show_todo_list(message)
@@ -300,10 +356,40 @@ async def get_notes(message: types.Message, state: FSMContext):
     await message.answer(f"Задача '{task_text}' с дедлайном '{deadline}' и примечаниями '{notes}' успешно добавлена!")
     await state.clear()
     await show_todo_list(message)
+
+# Обработчик кнопки "Удалить дела по дате"
+@dp.message(lambda message: message.text == "Удалить дела по дате")
+async def delete_tasks_by_date(message: types.Message, state: FSMContext):
+    await message.answer("Введите дату в формате ДД-ММ-ГГГГ для удаления задач:")
+    await state.set_state(TaskForm.waiting_for_date_to_delete)
+
+# Обработчик для удаления задач по дате
+@dp.message(TaskForm.waiting_for_date_to_delete)
+async def delete_tasks_by_date_handler(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    date_to_delete = message.text
+
+    try:
+        # Преобразуем введенную дату в формат datetime
+        date_to_delete = datetime.strptime(date_to_delete, "%d-%m-%Y").date()
+
+        # Удаляем задачи с указанной датой
+        await collection.update_one(
+            {"user_id": user_id},
+            {"$pull": {"tasks": {"deadline": {"$regex": f"{date_to_delete.strftime('%d-%m-%Y')}"}}}}
+        )
+        await message.answer(f"Все задачи на {date_to_delete.strftime('%d-%m-%Y')} удалены 🗑️.")
+    except ValueError:
+        await message.answer("❌ Неверный формат даты. Пожалуйста, используйте формат ДД-ММ-ГГГГ.")
+
+    await state.clear()
+    await show_todo_list(message)
+
 # Обработчик кнопки "Назад в меню"
 @dp.message(lambda message: message.text == "Назад в меню")
 async def back_to_main_menu(message: types.Message):
     await message.answer("Вы вернулись в главное меню:", reply_markup=main_keyboard)
+
 # Запуск бота
 async def main():
     await check_connection()
