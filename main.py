@@ -40,6 +40,10 @@ class TaskForm(StatesGroup):
     waiting_for_deadline_time = State()
     waiting_for_notes = State()
     waiting_for_date_to_delete = State()
+    waiting_for_new_task_text = State()  # Для изменения текста задачи
+    waiting_for_new_deadline_date = State()  # Для изменения даты дедлайна
+    waiting_for_new_deadline_time = State()  # Для изменения времени дедлайна
+    waiting_for_new_notes = State()  # Для изменения примечаний задачи
 
 # Функция получения списка дел из базы данных для конкретного пользователя
 async def get_todo_list(user_id):
@@ -200,6 +204,9 @@ async def show_task_details(message: types.Message, state: FSMContext):
 
     for task in tasks:
         if task.get("task_text") == task_text:
+            # Обновляем статус задачи перед отображением
+            task = await update_task_status(task)
+
             deadline_str = task.get("deadline")
             notes = task.get("notes", "Примечаний нет.")
             status = task.get("status", "в процессе")
@@ -207,7 +214,7 @@ async def show_task_details(message: types.Message, state: FSMContext):
                 "в процессе": "🟡",
                 "выполнено": "✅",
                 "просрочено": "❌"
-            }.get(status, "🟡")
+            }.get(status, "🟡")  # По умолчанию "в процессе"
 
             try:
                 deadline = datetime.strptime(deadline_str, "%d-%m-%Y %H:%M")
@@ -221,7 +228,7 @@ async def show_task_details(message: types.Message, state: FSMContext):
                 response_text = f"<b>{status_emoji} {task_text}</b>\n"
                 response_text += f"<b>Дедлайн:</b> {deadline_str}\n"
                 if time_left.days < 0 or minutes < 0 or hours < 0:
-                     response_text += f"<b>Просрочена!</b>\n"
+                    response_text += f"<b>Просрочена!</b>\n"
                 else:
                     response_text += f"<b>Осталось:</b> {time_left_str}\n"
                 response_text += f"<b>Примечания:</b> {notes}\n"
@@ -234,12 +241,15 @@ async def show_task_details(message: types.Message, state: FSMContext):
 
             # Сохраняем текст задачи в состоянии
             await state.update_data(task_to_delete=task_text)
-            # Добавляем кнопки для управления статусом
+            # Добавляем кнопки для управления статусом и изменения задачи
             markup = ReplyKeyboardMarkup(
                 keyboard=[
                     [KeyboardButton(text="Задача выполнена")],
                     [KeyboardButton(text="Вернуть задачу в ожидание")] if task.get("status") == "выполнено" else [],
                     [KeyboardButton(text="Удалить задачу")],
+                    [KeyboardButton(text="Изменить название задачи")],
+                    [KeyboardButton(text="Изменить дедлайн задачи")],
+                    [KeyboardButton(text="Изменить примечания задачи")],  # Переименованная кнопка
                     [KeyboardButton(text="Назад к списку задач")]
                 ],
                 resize_keyboard=True
@@ -431,8 +441,7 @@ async def delete_tasks_by_date_handler(message: types.Message, state: FSMContext
     await state.clear()
     await show_todo_list(message)
 
-
-# Измененный обработчик кнопки "Статистика"
+# Обработчик кнопки "Статистика"
 @dp.message(lambda message: message.text == "Статистика")
 async def show_statistics(message: types.Message):
     user_id = message.from_user.id
@@ -465,6 +474,99 @@ async def show_statistics(message: types.Message):
 @dp.message(lambda message: message.text == "Назад в меню")
 async def back_to_main_menu(message: types.Message):
     await message.answer("Вы вернулись в главное меню:", reply_markup=main_keyboard)
+
+# Обработчик для изменения названия задачи
+@dp.message(lambda message: message.text == "Изменить название задачи")
+async def change_task_text(message: types.Message, state: FSMContext):
+    await message.answer("Введите новое название задачи:")
+    await state.set_state(TaskForm.waiting_for_new_task_text)
+
+# Обработчик для сохранения нового названия задачи
+@dp.message(TaskForm.waiting_for_new_task_text)
+async def save_new_task_text(message: types.Message, state: FSMContext):
+    new_task_text = message.text
+    user_data = await state.get_data()
+    task_text = user_data.get("task_to_delete")
+    user_id = message.from_user.id
+
+    # Обновляем название задачи в базе данных
+    await collection.update_one(
+        {"user_id": user_id, "tasks.task_text": task_text},
+        {"$set": {"tasks.$.task_text": new_task_text}}
+    )
+    await message.answer(f"Название задачи изменено на: '{new_task_text}'.")
+    await state.clear()
+    await show_todo_list(message)
+
+# Обработчик для изменения дедлайна задачи
+@dp.message(lambda message: message.text == "Изменить дедлайн задачи")
+async def change_task_deadline_date(message: types.Message, state: FSMContext):
+    await message.answer("Введите новую дату дедлайна в формате ДД-ММ-ГГГГ:")
+    await state.set_state(TaskForm.waiting_for_new_deadline_date)
+
+# Обработчик для получения новой даты дедлайна
+@dp.message(TaskForm.waiting_for_new_deadline_date)
+async def get_new_deadline_date(message: types.Message, state: FSMContext):
+    try:
+        new_deadline_date = message.text
+        datetime.strptime(new_deadline_date, "%d-%m-%Y")
+        await state.update_data(new_deadline_date=new_deadline_date)
+        await message.answer("Введите новое время дедлайна в формате ЧЧ:ММ (24-часовой формат):")
+        await state.set_state(TaskForm.waiting_for_new_deadline_time)
+    except ValueError:
+        await message.answer("❌ Неверный формат даты. Пожалуйста, используйте формат ДД-ММ-ГГГГ:")
+
+# Обработчик для получения нового времени дедлайна
+@dp.message(TaskForm.waiting_for_new_deadline_time)
+async def get_new_deadline_time(message: types.Message, state: FSMContext):
+    try:
+        new_deadline_time = message.text
+        datetime.strptime(new_deadline_time, "%H:%M")
+        user_data = await state.get_data()
+        new_deadline_date = user_data.get('new_deadline_date')
+
+        # Объединяем дату и время в строку
+        new_deadline_str = f"{new_deadline_date} {new_deadline_time}"
+        #datetime.strptime(deadline_str, "%d-%m-%Y %H:%M")
+
+        user_data = await state.get_data()
+        task_text = user_data.get("task_to_delete")
+        user_id = message.from_user.id
+
+        # Обновляем дедлайн задачи в базе данных
+        await collection.update_one(
+            {"user_id": user_id, "tasks.task_text": task_text},
+            {"$set": {"tasks.$.deadline": new_deadline_str}}
+        )
+        await message.answer(f"Дедлайн задачи изменен на: '{new_deadline_str}'.")
+        await state.clear()
+        await show_todo_list(message)
+
+    except ValueError:
+        await message.answer("❌ Неверный формат времени. Пожалуйста, используйте формат ЧЧ:ММ (24-часовой формат).")
+
+# Обработчик для изменения примечаний задачи
+@dp.message(lambda message: message.text == "Изменить примечания задачи")
+async def change_task_notes(message: types.Message, state: FSMContext):
+    await message.answer("Введите новые примечания для задачи:")
+    await state.set_state(TaskForm.waiting_for_new_notes)
+
+# Обработчик для сохранения новых примечаний
+@dp.message(TaskForm.waiting_for_new_notes)
+async def save_new_task_notes(message: types.Message, state: FSMContext):
+    new_notes = message.text
+    user_data = await state.get_data()
+    task_text = user_data.get("task_to_delete")
+    user_id = message.from_user.id
+
+    # Обновляем примечания задачи в базе данных
+    await collection.update_one(
+        {"user_id": user_id, "tasks.task_text": task_text},
+        {"$set": {"tasks.$.notes": new_notes}}
+    )
+    await message.answer(f"Примечания задачи обновлены на: '{new_notes}'.")
+    await state.clear()
+    await show_todo_list(message)
 
 # Запуск бота
 async def main():
