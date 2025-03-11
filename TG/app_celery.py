@@ -32,7 +32,7 @@ def check_overdue_tasks_and_notify():
     loop.run_until_complete(check_overdue_tasks_and_notify_async())
 
 async def check_overdue_tasks_and_notify_async():
-    print("Yes")
+    print("Проверка просроченных задач...")
     users = await collection.find({}).to_list(None)
     for user in users:
         tasks = user.get("tasks", [])
@@ -57,10 +57,60 @@ async def check_overdue_tasks_and_notify_async():
                 )
     print("Проверка просроченных задач завершена")
 
+# Задача для отправки напоминания
+@celery_app.task
+def send_reminder(user_id, task_text, reminder_time):
+    """
+    Отправляет напоминание пользователю в указанное время.
+    """
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(send_reminder_async(user_id, task_text, reminder_time))
+
+async def send_reminder_async(user_id, task_text, reminder_time):
+    await bot.send_message(
+        chat_id=user_id,
+        text=f"⏰ Напоминание: задача '{task_text}' должна быть выполнена к {reminder_time}."
+    )
+
+# Задача для проверки и отправки напоминаний
+@celery_app.task
+def check_and_send_reminders():
+    """
+    Периодическая задача для проверки и отправки напоминаний.
+    """
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(check_and_send_reminders_async())
+
+async def check_and_send_reminders_async():
+    print("Проверка напоминаний...")
+    users = await collection.find({}).to_list(None)
+    now = datetime.now()
+
+    for user in users:
+        tasks = user.get("tasks", [])
+        for task in tasks:
+            if "reminder" in task:  # Проверяем, есть ли напоминание
+                reminder_time = datetime.strptime(task["reminder"], "%d-%m-%Y %H:%M")
+                if now >= reminder_time:  # Если время напоминания наступило
+                    await bot.send_message(
+                        chat_id=user["user_id"],
+                        text=f"⏰ Напоминание: задача '{task['task_text']}' должна быть выполнена к {task['reminder']}."
+                    )
+                    # Удаляем напоминание после отправки
+                    await collection.update_one(
+                        {"user_id": user["user_id"], "tasks.task_text": task["task_text"]},
+                        {"$unset": {"tasks.$.reminder": ""}}
+                    )
+    print("Проверка напоминаний завершена")
+
 # Периодические задачи (Celery Beat)
 celery_app.conf.beat_schedule = {
     "check-overdue-tasks": {
         "task": "app_celery.check_overdue_tasks_and_notify",
+        "schedule": timedelta(minutes=1),  # Запускать каждую минуту
+    },
+    "check-and-send-reminders": {
+        "task": "app_celery.check_and_send_reminders",
         "schedule": timedelta(minutes=1),  # Запускать каждую минуту
     },
 }
