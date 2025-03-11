@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 from collections import Counter
 from celery import Celery
 from app_celery import check_overdue_tasks_and_notify
+from app_celery import send_reminder
 
 # Токен бота
 TOKEN = "7651886591:AAEAZfTe8f8ga-WJxcXo65mjBaYyixAd7fo"
@@ -51,10 +52,12 @@ class TaskForm(StatesGroup):
     waiting_for_deadline_time = State()
     waiting_for_notes = State()
     waiting_for_date_to_delete = State()
-    waiting_for_new_task_text = State()  # Для изменения текста задачи
-    waiting_for_new_deadline_date = State()  # Для изменения даты дедлайна
-    waiting_for_new_deadline_time = State()  # Для изменения времени дедлайна
-    waiting_for_new_notes = State()  # Для изменения примечаний задачи
+    waiting_for_new_task_text = State()
+    waiting_for_new_deadline_date = State()
+    waiting_for_new_deadline_time = State()
+    waiting_for_new_notes = State()
+    waiting_for_reminder_date = State()  # Новое состояние для выбора даты напоминания
+    waiting_for_reminder_time = State()  # Новое состояние для выбора времени напоминания
 
 # Функция получения списка дел из базы данных для конкретного пользователя
 async def get_todo_list(user_id):
@@ -206,7 +209,7 @@ async def is_task_message(message: types.Message) -> bool:
     tasks = await get_todo_list(user_id)
     return message.text in [task.get("task_text") for task in tasks]
 
-# Обработчик выбора задачи
+
 @dp.message(is_task_message)
 async def show_task_details(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
@@ -225,7 +228,7 @@ async def show_task_details(message: types.Message, state: FSMContext):
                 "в процессе": "🟡",
                 "выполнено": "✅",
                 "просрочено": "❌"
-            }.get(status, "🟡")  # По умолчанию "в процессе"
+            }.get(status, "🟡")
 
             try:
                 deadline = datetime.strptime(deadline_str, "%d-%m-%Y %H:%M")
@@ -260,7 +263,8 @@ async def show_task_details(message: types.Message, state: FSMContext):
                     [KeyboardButton(text="Удалить задачу")],
                     [KeyboardButton(text="Изменить название задачи")],
                     [KeyboardButton(text="Изменить дедлайн задачи")],
-                    [KeyboardButton(text="Изменить примечания задачи")],  # Переименованная кнопка
+                    [KeyboardButton(text="Изменить примечания задачи")],
+                    [KeyboardButton(text="Сделать напоминание")],  # Новая кнопка
                     [KeyboardButton(text="Назад к списку задач")]
                 ],
                 resize_keyboard=True
@@ -269,7 +273,6 @@ async def show_task_details(message: types.Message, state: FSMContext):
             break
     else:
         await message.answer("Задача не найдена.", reply_markup=main_keyboard)
-
 # Обработчик для изменения статуса задачи
 @dp.message(lambda message: message.text == "Задача выполнена")
 async def mark_task_as_done(message: types.Message, state: FSMContext):
@@ -509,8 +512,67 @@ async def save_new_task_notes(message: types.Message, state: FSMContext):
     await state.clear()
     await show_todo_list(message)
 
+# Обработчик кнопки "Сделать напоминание"
+@dp.message(lambda message: message.text == "Сделать напоминание")
+async def set_reminder(message: types.Message, state: FSMContext):
+    await message.answer("Введите дату напоминания в формате ДД-ММ-ГГГГ:")
+    await state.set_state(TaskForm.waiting_for_reminder_date)
 
+# Обработчик для получения даты напоминания
+@dp.message(TaskForm.waiting_for_reminder_date)
+async def get_reminder_date(message: types.Message, state: FSMContext):
+    try:
+        reminder_date = message.text
+        reminder_datetime = datetime.strptime(reminder_date, "%d-%m-%Y")
+        now = datetime.now()
+        if reminder_datetime.date() < now.date():
+            await message.answer("❌ Нельзя выбрать дату из прошлого. Пожалуйста, введите корректную дату в формате ДД-ММ-ГГГГ:")
+            return
+        await state.update_data(reminder_date=reminder_date)
+        await message.answer("Введите время напоминания в формате ЧЧ:ММ (24-часовой формат):")
+        await state.set_state(TaskForm.waiting_for_reminder_time)
+    except ValueError:
+        await message.answer("❌ Неверный формат даты. Пожалуйста, используйте формат ДД-ММ-ГГГГ.")
 
+# Обработчик для получения времени напоминания
+@dp.message(TaskForm.waiting_for_reminder_time)
+async def get_reminder_time(message: types.Message, state: FSMContext):
+    try:
+        reminder_time = message.text
+        datetime.strptime(reminder_time, "%H:%M")  # Проверка формата времени
+        user_data = await state.get_data()
+        task_text = user_data.get('task_to_delete')
+        reminder_date = user_data.get('reminder_date')
+
+        # Объединяем дату и время в строку
+        reminder_str = f"{reminder_date} {reminder_time}"
+        reminder = datetime.strptime(reminder_str, "%d-%m-%Y %H:%M")
+
+        # Получаем дедлайн задачи
+        user_id = message.from_user.id
+        user = await collection.find_one({"user_id": user_id, "tasks.task_text": task_text})
+        task = next((t for t in user["tasks"] if t["task_text"] == task_text), None)
+        deadline = datetime.strptime(task["deadline"], "%d-%m-%Y %H:%M")
+
+        # Проверяем, что напоминание не позже дедлайна
+        if reminder > deadline:
+            await message.answer("❌ Напоминание не может быть позже дедлайна. Пожалуйста, введите корректное время:")
+            return
+
+        # Сохраняем напоминание в базе данных
+        await collection.update_one(
+            {"user_id": user_id, "tasks.task_text": task_text},
+            {"$set": {"tasks.$.reminder": reminder_str}}
+        )
+
+        # Запускаем задачу Celery для отправки напоминания
+        send_reminder.apply_async(args=[user_id, task_text, reminder_str], eta=reminder)
+
+        await message.answer(f"Напоминание для задачи '{task_text}' установлено на {reminder_str}.")
+        await state.clear()
+        await show_todo_list(message)
+    except ValueError:
+        await message.answer("❌ Неверный формат времени. Пожалуйста, используйте формат ЧЧ:ММ (24-часовой формат).")
 # Запуск бота
 async def main():
     await check_connection()
