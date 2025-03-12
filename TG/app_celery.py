@@ -92,9 +92,10 @@ async def check_and_send_reminders_async():
             if "reminder" in task:  # Проверяем, есть ли напоминание
                 reminder_time = datetime.strptime(task["reminder"], "%d-%m-%Y %H:%M")
                 if now >= reminder_time:  # Если время напоминания наступило
+                    # Отправляем напоминание с указанием дедлайна
                     await bot.send_message(
                         chat_id=user["user_id"],
-                        text=f"⏰ Напоминание: задача '{task['task_text']}' должна быть выполнена к {task['reminder']}."
+                        text=f"⏰ Напоминание: задача '{task['task_text']}' должна быть выполнена к {task['deadline']}."
                     )
                     # Удаляем напоминание после отправки
                     await collection.update_one(
