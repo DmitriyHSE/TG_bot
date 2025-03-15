@@ -27,6 +27,8 @@ def check_overdue_tasks_and_notify():
     """
     Проверяет все задачи на просроченность.
     Если задача просрочена, отправляет уведомление пользователю и продлевает дедлайн на 1 день.
+    Если задача уже была пролонгирована, она считается не выполненной.
+    Уведомление о просроченной задаче отправляется только один раз.
     """
     loop = asyncio.get_event_loop()
     loop.run_until_complete(check_overdue_tasks_and_notify_async())
@@ -40,21 +42,41 @@ async def check_overdue_tasks_and_notify_async():
             deadline = datetime.strptime(task["deadline"], "%d-%m-%Y %H:%M")
             now = datetime.now()
             if task["status"] != "выполнено" and now > deadline:
-                # Уведомление о просроченной задаче
-                await bot.send_message(
-                    chat_id=user["user_id"],
-                    text=f"⚠️ Задача '{task['task_text']}' просрочена! Дедлайн продлен на 1 день."
-                )
+                if not task.get("prolonged", False):  # Проверяем, была ли задача уже пролонгирована
+                    # Уведомление о просроченной задаче
+                    await bot.send_message(
+                        chat_id=user["user_id"],
+                        text=f"⚠️ Задача '{task['task_text']}' просрочена! Дедлайн продлен на 1 день."
+                    )
 
-                # Продление дедлайна на 1 день
-                new_deadline = deadline + timedelta(days=1)
-                task["deadline"] = new_deadline.strftime("%d-%m-%Y %H:%M")
+                    # Продление дедлайна на 1 день
+                    new_deadline = deadline + timedelta(days=1)
+                    task["deadline"] = new_deadline.strftime("%d-%m-%Y %H:%M")
 
-                # Обновление задачи в базе данных
-                await collection.update_one(
-                    {"user_id": user["user_id"], "tasks.task_text": task["task_text"]},
-                    {"$set": {"tasks.$.deadline": task["deadline"]}}
-                )
+                    # Устанавливаем флаг, что задача была пролонгирована
+                    task["prolonged"] = True
+
+                    # Обновление задачи в базе данных
+                    await collection.update_one(
+                        {"user_id": user["user_id"], "tasks.task_text": task["task_text"]},
+                        {"$set": {"tasks.$.deadline": task["deadline"], "tasks.$.prolonged": True}}
+                    )
+                else:
+                    # Если задача уже была пролонгирована, проверяем, было ли уже отправлено уведомление
+                    if not task.get("notified", False):
+                        # Уведомление о том, что задача просрочена и не была выполнена
+                        await bot.send_message(
+                            chat_id=user["user_id"],
+                            text=f"⚠️ Задача '{task['task_text']}' просрочена и не была выполнена!"
+                        )
+                        # Устанавливаем флаг, что уведомление было отправлено
+                        task["notified"] = True
+
+                        # Обновление задачи в базе данных
+                        await collection.update_one(
+                            {"user_id": user["user_id"], "tasks.task_text": task["task_text"]},
+                            {"$set": {"tasks.$.notified": True}}
+                        )
     print("Проверка просроченных задач завершена")
 
 # Задача для отправки напоминания
