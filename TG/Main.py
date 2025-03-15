@@ -45,6 +45,7 @@ dp = Dispatcher(storage=storage)
 
 # В нужном месте кода вызывайте задачу через Celery
 check_overdue_tasks_and_notify.delay()
+
 # Состояния для FSM
 class TaskForm(StatesGroup):
     waiting_for_task = State()
@@ -56,8 +57,8 @@ class TaskForm(StatesGroup):
     waiting_for_new_deadline_date = State()
     waiting_for_new_deadline_time = State()
     waiting_for_new_notes = State()
-    waiting_for_reminder_date = State()  # Новое состояние для выбора даты напоминания
-    waiting_for_reminder_time = State()  # Новое состояние для выбора времени напоминания
+    waiting_for_reminder_date = State()
+    waiting_for_reminder_time = State()
 
 # Функция получения списка дел из базы данных для конкретного пользователя
 async def get_todo_list(user_id):
@@ -113,7 +114,7 @@ async def create_todo_keyboard(tasks):
     buttons.append([KeyboardButton(text="Назад в меню")])
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True, one_time_keyboard=True)
 
-# Клавиатура главного меню (добавлена кнопка "Статистика")
+# Клавиатура главного меню
 main_keyboard = ReplyKeyboardMarkup(
     keyboard=[[
         KeyboardButton(text="Показать список дел")
@@ -188,7 +189,7 @@ async def show_todo_list(message: types.Message):
 
                     except ValueError as e:
                         print(f"Ошибка при преобразовании даты: {e}")
-                        task_list_text += f"Ошибка при отображении дедлайна\n" #Сообщение об ошибке, если что-то пошло не так
+                        task_list_text += f"Ошибка при отображении дедлайна\n"
 
         todo_keyboard = await create_todo_keyboard(tasks)
         await message.answer(task_list_text, reply_markup=todo_keyboard, parse_mode="HTML")
@@ -208,7 +209,6 @@ async def is_task_message(message: types.Message) -> bool:
     user_id = message.from_user.id
     tasks = await get_todo_list(user_id)
     return message.text in [task.get("task_text") for task in tasks]
-
 
 @dp.message(is_task_message)
 async def show_task_details(message: types.Message, state: FSMContext):
@@ -256,23 +256,33 @@ async def show_task_details(message: types.Message, state: FSMContext):
             # Сохраняем текст задачи в состоянии
             await state.update_data(task_to_delete=task_text)
             # Добавляем кнопки для управления статусом и изменения задачи
-            markup = ReplyKeyboardMarkup(
-                keyboard=[
-                    [KeyboardButton(text="Задача выполнена")],
-                    [KeyboardButton(text="Вернуть задачу в ожидание")] if task.get("status") == "выполнено" else [],
-                    [KeyboardButton(text="Удалить задачу")],
-                    [KeyboardButton(text="Изменить название задачи")],
-                    [KeyboardButton(text="Изменить дедлайн задачи")],
-                    [KeyboardButton(text="Изменить примечания задачи")],
-                    [KeyboardButton(text="Сделать напоминание")],  # Новая кнопка
-                    [KeyboardButton(text="Назад к списку задач")]
-                ],
-                resize_keyboard=True
-            )
+            if task.get("status") in ["в процессе", "выполнено"]:
+                markup = ReplyKeyboardMarkup(
+                    keyboard=[
+                        [KeyboardButton(text="Задача выполнена")],
+                        [KeyboardButton(text="Вернуть задачу в ожидание")] if task.get("status") == "выполнено" else [],
+                        [KeyboardButton(text="Удалить задачу")],
+                        [KeyboardButton(text="Изменить название задачи")],
+                        [KeyboardButton(text="Изменить дедлайн задачи")],
+                        [KeyboardButton(text="Изменить примечания задачи")],
+                        [KeyboardButton(text="Сделать напоминание")],
+                        [KeyboardButton(text="Назад к списку задач")]
+                    ],
+                    resize_keyboard=True
+                )
+            else:
+                markup = ReplyKeyboardMarkup(
+                    keyboard=[
+                        [KeyboardButton(text="Удалить задачу")],
+                        [KeyboardButton(text="Назад к списку задач")]
+                    ],
+                    resize_keyboard=True
+                )
             await message.answer(response_text, reply_markup=markup, parse_mode="HTML")
             break
     else:
         await message.answer("Задача не найдена.", reply_markup=main_keyboard)
+
 # Обработчик для изменения статуса задачи
 @dp.message(lambda message: message.text == "Задача выполнена")
 async def mark_task_as_done(message: types.Message, state: FSMContext):
@@ -573,6 +583,84 @@ async def get_reminder_time(message: types.Message, state: FSMContext):
         await show_todo_list(message)
     except ValueError:
         await message.answer("❌ Неверный формат времени. Пожалуйста, используйте формат ЧЧ:ММ (24-часовой формат).")
+
+# Обработчик для изменения названия задачи
+@dp.message(lambda message: message.text == "Изменить название задачи")
+async def change_task_name(message: types.Message, state: FSMContext):
+    await message.answer("Введите новое название задачи:")
+    await state.set_state(TaskForm.waiting_for_new_task_text)
+
+# Обработчик для сохранения нового названия задачи
+@dp.message(TaskForm.waiting_for_new_task_text)
+async def save_new_task_name(message: types.Message, state: FSMContext):
+    new_task_text = message.text
+    user_data = await state.get_data()
+    old_task_text = user_data.get("task_to_delete")
+    user_id = message.from_user.id
+
+    # Обновляем название задачи в базе данных
+    await collection.update_one(
+        {"user_id": user_id, "tasks.task_text": old_task_text},
+        {"$set": {"tasks.$.task_text": new_task_text}}
+    )
+    await message.answer(f"Название задачи изменено на: '{new_task_text}'.")
+    await state.clear()
+    await show_todo_list(message)
+
+# Обработчик для изменения дедлайна задачи
+@dp.message(lambda message: message.text == "Изменить дедлайн задачи")
+async def change_task_deadline(message: types.Message, state: FSMContext):
+    await message.answer("Введите новую дату дедлайна в формате ДД-ММ-ГГГГ:")
+    await state.set_state(TaskForm.waiting_for_new_deadline_date)
+
+# Обработчик для получения новой даты дедлайна
+@dp.message(TaskForm.waiting_for_new_deadline_date)
+async def get_new_deadline_date(message: types.Message, state: FSMContext):
+    try:
+        new_deadline_date = message.text
+        new_deadline_datetime = datetime.strptime(new_deadline_date, "%d-%m-%Y")
+        now = datetime.now()
+        if new_deadline_datetime.date() < now.date():
+            await message.answer("❌ Нельзя выбрать дату из прошлого. Пожалуйста, введите корректную дату в формате ДД-ММ-ГГГГ:")
+            return
+        await state.update_data(new_deadline_date=new_deadline_date)
+        await message.answer("Введите новое время дедлайна в формате ЧЧ:ММ (24-часовой формат):")
+        await state.set_state(TaskForm.waiting_for_new_deadline_time)
+    except ValueError:
+        await message.answer("❌ Неверный формат даты. Пожалуйста, используйте формат ДД-ММ-ГГГГ.")
+
+# Обработчик для получения нового времени дедлайна
+@dp.message(TaskForm.waiting_for_new_deadline_time)
+async def get_new_deadline_time(message: types.Message, state: FSMContext):
+    try:
+        new_deadline_time = message.text
+        datetime.strptime(new_deadline_time, "%H:%M")  # Проверка формата времени
+        user_data = await state.get_data()
+        task_text = user_data.get('task_to_delete')
+        new_deadline_date = user_data.get('new_deadline_date')
+
+        # Объединяем дату и время в строку
+        new_deadline_str = f"{new_deadline_date} {new_deadline_time}"
+        new_deadline = datetime.strptime(new_deadline_str, "%d-%m-%Y %H:%M")
+
+        # Проверяем, что новый дедлайн не в прошлом
+        now = datetime.now()
+        if new_deadline < now:
+            await message.answer("❌ Нельзя выбрать время из прошлого. Пожалуйста, введите корректное время в формате ЧЧ:ММ:")
+            return
+
+        # Обновляем дедлайн задачи в базе данных
+        user_id = message.from_user.id
+        await collection.update_one(
+            {"user_id": user_id, "tasks.task_text": task_text},
+            {"$set": {"tasks.$.deadline": new_deadline_str}}
+        )
+        await message.answer(f"Дедлайн задачи изменен на: '{new_deadline_str}'.")
+        await state.clear()
+        await show_todo_list(message)
+    except ValueError:
+        await message.answer("❌ Неверный формат времени. Пожалуйста, используйте формат ЧЧ:ММ (24-часовой формат).")
+
 # Запуск бота
 async def main():
     await check_connection()
